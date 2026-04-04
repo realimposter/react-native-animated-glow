@@ -1,0 +1,22 @@
+{
+  "extends": "expo/tsconfig.base",
+  "compilerOptions": {
+    "strict": true,
+    "paths": {
+      "@/*": [
+        "./*"
+      ]
+    },
+    // --- FIXES ---
+    // Tells TypeScript how to handle JSX for React Native
+    "jsx": "react-native", 
+    // Allows default imports from modules that use older export styles (like React)
+    "esModuleInterop": true 
+  },
+  "include": [
+    "**/*.ts",
+    "**/*.tsx",
+    ".expo/types/**/*.ts",
+    "expo-env.d.ts"
+  ]
+}
