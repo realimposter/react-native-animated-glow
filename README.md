@@ -199,6 +199,8 @@ For a complete list of all available props and their descriptions, please see th
 
 ## Changelog
 
+### `v3.0.2` — Samsung freeze fix (load-bearing)
+
 ### `v3.0.1`
 -   Added `activeState` prop.
 -   Removed insternal state management

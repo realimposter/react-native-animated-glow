@@ -15,56 +15,82 @@ import {
 
 const MAX_SKIA_LAYERS = 10;
 
+// Color uniforms and color-math intermediates use half-precision (half4
+// and half) instead of vec4/float. SkSL doesn't accept GLSL's
+// `precision mediump float;` directives — the keyword is reserved but
+// unimplemented — so half-typed declarations are the SkSL-native way to
+// drop color paths to mediump. Geometry uniforms (resolution, rectSize,
+// cornerRadius, borderWidth, glowSizes, layerProgress, etc.) stay as
+// float because distance/perimeter math needs highp accuracy.
+//
+// Why this matters: Samsung devices (verified S21 Ultra Snapdragon 888 /
+// Adreno 660; reproduces on other modern Samsung models) ship a modified
+// Adreno driver that promotes vec4/float color arithmetic to highp,
+// where every other tested driver (stock Adreno on Pixel, Apple Metal,
+// Mali, older Adreno builds) defaults the same color paths to mediump.
+// Highp color math runs ~5x slower per fragment on Samsung's driver.
+
+// DON'T undo this. Changing color types back to vec4 reintroduces the
+// Samsung freeze. Half-precision color typing is load-bearing.
 const sksl = `
   uniform vec2 u_resolution;
   uniform vec2 u_rectSize;
   uniform float u_cornerRadius;
-  uniform vec4 u_backgroundColor;
-  
+  uniform half4 u_backgroundColor;
+
   uniform float u_borderWidth;
   uniform float u_borderProgress;
-  
+
   uniform int u_layerCount;
   uniform float u_coverage[${MAX_SKIA_LAYERS}];
-  uniform vec4 u_glowSizes[${MAX_SKIA_LAYERS}]; 
+  uniform vec4 u_glowSizes[${MAX_SKIA_LAYERS}];
   uniform float u_opacity[${MAX_SKIA_LAYERS}];
   uniform float u_relativeOffset[${MAX_SKIA_LAYERS}];
   uniform float u_layerProgress[${MAX_SKIA_LAYERS}];
 
-  uniform vec4 u_colors_0[8];
-  uniform vec4 u_colors_1[8];
-  uniform vec4 u_colors_2[8];
-  uniform vec4 u_colors_3[8];
-  uniform vec4 u_colors_4[8];
-  uniform vec4 u_colors_5[8];
-  uniform vec4 u_colors_6[8];
-  uniform vec4 u_colors_7[8];
-  uniform vec4 u_colors_8[8];
-  uniform vec4 u_colors_9[8];
-  uniform vec4 u_colors_10[8];
+  uniform half4 u_colors_0[8];
+  uniform half4 u_colors_1[8];
+  uniform half4 u_colors_2[8];
+  uniform half4 u_colors_3[8];
+  uniform half4 u_colors_4[8];
+  uniform half4 u_colors_5[8];
+  uniform half4 u_colors_6[8];
+  uniform half4 u_colors_7[8];
+  uniform half4 u_colors_8[8];
+  uniform half4 u_colors_9[8];
+  uniform half4 u_colors_10[8];
 
   uniform float u_masterOpacity;
   uniform float u_placements[${MAX_SKIA_LAYERS}];
   uniform float u_isBorderAnimated;
 
   const float PI = 3.14159265359;
-  float smooth(float t) { return t * t * (3.0 - 2.0 * t); }
-  vec4 getGradientColor(float progress, vec4 colors[8]) { float t=progress*7.0;vec4 finalColor=colors[7];for(int i=6;i>=0;i--){if(t<float(i+1)){finalColor=mix(colors[i],colors[i+1],t-float(i));}}return finalColor; }
+  float smoothCubic(float t) { return t * t * (3.0 - 2.0 * t); }
+  half4 getGradientColor(float progress, half4 colors[8]) {
+    float t = progress * 7.0;
+    half4 finalColor = colors[7];
+    for (int i = 6; i >= 0; i--) {
+      if (t < float(i + 1)) {
+        finalColor = mix(colors[i], colors[i + 1], half(t - float(i)));
+      }
+    }
+    return finalColor;
+  }
   float sdfRoundedBox(vec2 p, vec2 b, float r) { vec2 q=abs(p)-b+r;return min(max(q.x,q.y),0.0)+length(max(q,0.0))-r; }
   float calculatePerimeterProgress(vec2 p, vec2 b, float r) { float w=b.x-r;float h=b.y-r;float c=PI*r/2.0;float H=2.0*w;float V=2.0*h;float s0_end=c;float s1_end=s0_end+H;float s2_end=s1_end+c;float s3_end=s2_end+V;float s4_end=s3_end+c;float s5_end=s4_end+H;float s6_end=s5_end+c;float perimeter=s6_end+V;if(perimeter==0.0)return 0.0;float dist=0.0;if(p.x<-w){if(p.y<-h){vec2 corner_p=p-vec2(-w,-h);dist=c*((atan(corner_p.y,corner_p.x)+PI)/(PI/2.0));}else if(p.y>h){vec2 corner_p=p-vec2(-w,h);dist=s5_end+c*((atan(corner_p.y,corner_p.x)-PI/2.0)/(PI/2.0));}else{dist=s6_end+(h-p.y);}}else if(p.x>w){if(p.y<-h){vec2 corner_p=p-vec2(w,-h);dist=s1_end+c*((atan(corner_p.y,corner_p.x)+PI/2.0)/(PI/2.0));}else if(p.y>h){vec2 corner_p=p-vec2(w,h);dist=s3_end+c*(atan(corner_p.y,corner_p.x)/(PI/2.0));}else{dist=s2_end+(h+p.y);}}else{if(p.y<0.0){dist=s0_end+(w+p.x);}else{dist=s4_end+(w-p.x);}} return dist/perimeter; }
-  float getInterpolatedSize(float progress, vec4 sizes) { float segLen=1.0/3.0;if(progress<segLen){return mix(sizes.x,sizes.y,smooth(progress/segLen));}else if(progress<2.0*segLen){return mix(sizes.y,sizes.z,smooth((progress-segLen)/segLen));}else{return mix(sizes.z,sizes.w,smooth((progress-2.0*segLen)/segLen));} }
+  float getInterpolatedSize(float progress, vec4 sizes) { float segLen=1.0/3.0;if(progress<segLen){return mix(sizes.x,sizes.y,smoothCubic(progress/segLen));}else if(progress<2.0*segLen){return mix(sizes.y,sizes.z,smoothCubic((progress-segLen)/segLen));}else{return mix(sizes.z,sizes.w,smoothCubic((progress-2.0*segLen)/segLen));} }
   float gaussian(float x, float mu, float sigma) { if(sigma<=0.0)return 0.0;return exp(-(pow(x-mu,2.0))/(2.0*pow(sigma,2.0))); }
-  
-  vec4 main(vec2 fragCoord) {
+
+  half4 main(vec2 fragCoord) {
     vec2 center = u_resolution * 0.5;
     vec2 p = fragCoord - center;
     vec2 b = u_rectSize * 0.5;
     float d = sdfRoundedBox(p, b, u_cornerRadius);
     float perimeterProgress = calculatePerimeterProgress(p, b, u_cornerRadius);
-    
-    vec4 behindGlow = vec4(0.0);
-    vec4 frontGlow = vec4(0.0);
-    
+
+    half4 behindGlow = half4(0.0);
+    half4 frontGlow = half4(0.0);
+
     for (int i = 0; i < ${MAX_SKIA_LAYERS}; i++) {
         if (i >= u_layerCount) break;
         float animatedProgress = fract(perimeterProgress - u_layerProgress[i] + u_relativeOffset[i]);
@@ -74,7 +100,7 @@ const sksl = `
         float calculatedOpacity = gaussian(abs(d), 0.0, currentGlowSize);
         if (d > 0.0 && u_placements[i] == 1.0) calculatedOpacity = 0.0;
         if (calculatedOpacity > 0.0) {
-            vec4 color;
+            half4 color = half4(0.0);
             if (i == 0) color = getGradientColor(segmentProgress, u_colors_1);
             else if (i == 1) color = getGradientColor(segmentProgress, u_colors_2);
             else if (i == 2) color = getGradientColor(segmentProgress, u_colors_3);
@@ -85,8 +111,8 @@ const sksl = `
             else if (i == 7) color = getGradientColor(segmentProgress, u_colors_8);
             else if (i == 8) color = getGradientColor(segmentProgress, u_colors_9);
             else if (i == 9) color = getGradientColor(segmentProgress, u_colors_10);
-            
-            vec4 glowComponent = color * calculatedOpacity * u_opacity[i];
+
+            half4 glowComponent = color * half(calculatedOpacity) * half(u_opacity[i]);
             if (u_placements[i] == 0.0) {
                 behindGlow += glowComponent;
             } else {
@@ -94,25 +120,25 @@ const sksl = `
             }
         }
     }
-    
-    vec4 finalColor = behindGlow;
+
+    half4 finalColor = behindGlow;
     if (d <= 0.0) {
         finalColor = mix(finalColor, u_backgroundColor, u_backgroundColor.a);
     }
     finalColor += frontGlow;
-    
+
     if (u_isBorderAnimated > 0.5 && u_borderWidth > 0.0) {
       float borderDist = abs(d);
       float halfWidth = u_borderWidth / 2.0;
       float borderStrength = 1.0 - smoothstep(halfWidth - 1.0, halfWidth + 1.0, borderDist);
       if (borderStrength > 0.0) {
         float borderAnimatedProgress = fract(perimeterProgress - u_borderProgress);
-        vec4 borderColor = getGradientColor(borderAnimatedProgress, u_colors_0);
-        finalColor = mix(finalColor, borderColor, borderStrength);
+        half4 borderColor = getGradientColor(borderAnimatedProgress, u_colors_0);
+        finalColor = mix(finalColor, borderColor, half(borderStrength));
       }
     }
 
-    return finalColor * u_masterOpacity;
+    return finalColor * half(u_masterOpacity);
   }
 `;
 
