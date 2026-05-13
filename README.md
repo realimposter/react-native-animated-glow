@@ -1,4 +1,4 @@
-# React Native Animated Glow v3.1.0
+# React Native Animated Glow v3.2.0
 
 <div align="center">
 
@@ -199,6 +199,11 @@ For a complete list of all available props and their descriptions, please see th
 
 ## Changelog
 
+### `v3.2.0`
+-   **Fixed Samsung Adreno crash on first draw** — `getGradientColor` previously used a reverse-iterating loop with conditional assignment-without-break (`for (i=6; i>=0; i--) { if (...) finalColor = mix(...); }`). Some Samsung Adreno shader compilers (verified Galaxy S25 / Adreno 750, Vulkan backend) reject this pattern at link/first-draw time and crash the app with `SIGABRT`. Switched to forward iteration with explicit `break` — output is bit-identical (both find the same gradient segment) and compiles cleanly everywhere.
+-   **Fixed Samsung Adreno 1 fps perf regression** — the per-layer `for(i<10)` loop with an 11-way `if/else` chain to "dynamically index" into `u_colors_N` (workaround for SKSL not allowing dynamic uniform array indexing) hits register-spill / branch-divergence pathology in Samsung Adreno's compiler — same shader runs at 60 fps on iOS / Pixel / Mali but ~1 fps on modern Samsung. Unrolled the per-layer rendering into 7 inline blocks; compiles to straight-line GPU code that runs at 60 fps on Samsung and is at least as fast on every other tested device. **Tradeoff:** presets are now capped at 7 simultaneous layers (was 10). To support more, paste additional inline blocks in `UnifiedSkiaGlow.tsx` — pattern is mechanical.
+-   See the **Samsung Adreno notes** section below for the full investigation.
+
 ### `v3.1.0`
 -   Fixed Samsung/Adreno freezes by keeping SkSL color math on `half4` precision.
 -   Fixed Android Expo dev OOMs by avoiding native lazy loading for the Skia renderer.
@@ -228,6 +233,18 @@ This version marked a complete architectural rewrite for maximum performance and
 
 ### `v1.0.0`
 -   Initial release using glow particles and reanimated
+
+## Samsung Adreno notes
+
+If you're contributing to the SKSL shader in `UnifiedSkiaGlow.tsx`, three things in there are load-bearing for Samsung Adreno compatibility — please don't undo any of them:
+
+1. **`half4` color uniforms and color-math intermediates.** Samsung's modified Adreno driver promotes `vec4` / `float` color arithmetic to highp where every other tested driver defaults to mediump — ~5x per-fragment slowdown. SKSL doesn't accept `precision mediump float;` directives, so half-typed declarations are the SKSL-native way to drop color paths to mediump. (Fixed in v3.1.0.)
+
+2. **`getGradientColor` uses a forward loop with explicit `break`.** The reverse form (`for (i=6; i>=0; i--)` with conditional assignment, no break) crashes Samsung Adreno at link/first-draw time. Both forms produce identical output. (Fixed in v3.2.0.)
+
+3. **The per-layer rendering is unrolled into 7 inline blocks** instead of a `for(i<10)` loop with an 11-way `if/else` color-array picker. The looped form runs at ~1 fps on Samsung Adreno because SKSL's lack of dynamic uniform array indexing forces an `if/else` chain that combines with the dynamic loop to hit register-spill / branch-divergence pathology in Samsung's shader compiler. Unrolled inline blocks compile to straight-line GPU code that runs at 60 fps. The current shader caps at 7 layers; presets needing more should add additional inline blocks (pattern is mechanical and well-tested). (Fixed in v3.2.0.)
+
+If you're seeing Samsung-specific crashes or freezes after modifying the shader, check those three conventions first.
 
 ## License
 This project is licensed under the MIT License.

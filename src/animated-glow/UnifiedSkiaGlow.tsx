@@ -32,6 +32,38 @@ const MAX_SKIA_LAYERS = 10;
 
 // DON'T undo this. Changing color types back to vec4 reintroduces the
 // Samsung freeze. Half-precision color typing is load-bearing.
+//
+// Two more Samsung Adreno fixes are also load-bearing in this shader:
+//
+//  1. `getGradientColor` uses a FORWARD loop with a "found" boolean
+//     flag (no break). Three forms have been tried, two of them buggy:
+//       (a) original reverse-no-break: crashes Samsung S25 / Adreno
+//           750 at link/first-draw time (verified, reproduces on
+//           other modern Samsung models).
+//       (b) forward + explicit break: compiles cleanly on Samsung
+//           S25 but produces visible vertical-line artifacts on the
+//           glow output on other Adreno builds — divergent
+//           wavefronts (different fragments break at different
+//           iterations) miscompile in combination with the array
+//           indexing inside the body.
+//       (c) shipping form: forward loop with "found" boolean —
+//           UNIFORM iteration count (always 7), single conditional
+//           write gated by the flag, no break. Same first-match
+//           semantics as (b) without the divergence.
+//     Don't switch back to (a) or (b).
+//
+//  2. Layer rendering is UNROLLED into 7 inline blocks instead of a
+//     `for(i<10)` loop with an 11-way `if/else` chain to "dynamically
+//     index" into u_colors_N. SKSL doesn't allow dynamic indexing of
+//     uniform arrays, so the if/else chain was the standard workaround,
+//     but on Samsung Adreno's compiler it combines with the dynamic loop
+//     to hit register-spill / branch-divergence pathology and runs at
+//     ~1 fps. Unrolled inline blocks compile to straight-line GPU code
+//     that Samsung Adreno executes at 60 fps (and is at least as fast
+//     on every other GPU we've tested — iOS Metal, stock Adreno on
+//     Pixel, Mali). Tradeoff: presets with 8+ layers only render layers
+//     1-7. To support more, paste more inline blocks below — the pattern
+//     is mechanical.
 const sksl = `
   uniform vec2 u_resolution;
   uniform vec2 u_rectSize;
@@ -65,75 +97,235 @@ const sksl = `
   uniform float u_isBorderAnimated;
 
   const float PI = 3.14159265359;
+
   float smoothCubic(float t) { return t * t * (3.0 - 2.0 * t); }
+
+  // Forward iteration with a "found" flag (Samsung Adreno fix #1 — see
+  // top-of-file comment for the three-form history). Uniform iteration
+  // count (always 7), single conditional write gated by the flag, no
+  // break — works on both Samsung S25 and other Adreno builds where the
+  // forward+break form caused vertical-line artifacts.
+  // DO NOT switch to either of the two predecessor forms.
   half4 getGradientColor(float progress, half4 colors[8]) {
     float t = progress * 7.0;
     half4 finalColor = colors[7];
-    for (int i = 6; i >= 0; i--) {
-      if (t < float(i + 1)) {
+    bool found = false;
+    for (int i = 0; i <= 6; i++) {
+      if (!found && t < float(i + 1)) {
         finalColor = mix(colors[i], colors[i + 1], half(t - float(i)));
+        found = true;
       }
     }
     return finalColor;
   }
-  float sdfRoundedBox(vec2 p, vec2 b, float r) { vec2 q=abs(p)-b+r;return min(max(q.x,q.y),0.0)+length(max(q,0.0))-r; }
-  float calculatePerimeterProgress(vec2 p, vec2 b, float r) { float w=b.x-r;float h=b.y-r;float c=PI*r/2.0;float H=2.0*w;float V=2.0*h;float s0_end=c;float s1_end=s0_end+H;float s2_end=s1_end+c;float s3_end=s2_end+V;float s4_end=s3_end+c;float s5_end=s4_end+H;float s6_end=s5_end+c;float perimeter=s6_end+V;if(perimeter==0.0)return 0.0;float dist=0.0;if(p.x<-w){if(p.y<-h){vec2 corner_p=p-vec2(-w,-h);dist=c*((atan(corner_p.y,corner_p.x)+PI)/(PI/2.0));}else if(p.y>h){vec2 corner_p=p-vec2(-w,h);dist=s5_end+c*((atan(corner_p.y,corner_p.x)-PI/2.0)/(PI/2.0));}else{dist=s6_end+(h-p.y);}}else if(p.x>w){if(p.y<-h){vec2 corner_p=p-vec2(w,-h);dist=s1_end+c*((atan(corner_p.y,corner_p.x)+PI/2.0)/(PI/2.0));}else if(p.y>h){vec2 corner_p=p-vec2(w,h);dist=s3_end+c*(atan(corner_p.y,corner_p.x)/(PI/2.0));}else{dist=s2_end+(h+p.y);}}else{if(p.y<0.0){dist=s0_end+(w+p.x);}else{dist=s4_end+(w-p.x);}} return dist/perimeter; }
-  float getInterpolatedSize(float progress, vec4 sizes) { float segLen=1.0/3.0;if(progress<segLen){return mix(sizes.x,sizes.y,smoothCubic(progress/segLen));}else if(progress<2.0*segLen){return mix(sizes.y,sizes.z,smoothCubic((progress-segLen)/segLen));}else{return mix(sizes.z,sizes.w,smoothCubic((progress-2.0*segLen)/segLen));} }
-  float gaussian(float x, float mu, float sigma) { if(sigma<=0.0)return 0.0;return exp(-(pow(x-mu,2.0))/(2.0*pow(sigma,2.0))); }
 
+  float sdfRoundedBox(vec2 p, vec2 b, float r) {
+    vec2 q = abs(p) - b + r;
+    return min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - r;
+  }
+
+  float calculatePerimeterProgress(vec2 p, vec2 b, float r) {
+    float w = b.x - r;
+    float h = b.y - r;
+    float c = PI * r / 2.0;
+    float H = 2.0 * w;
+    float V = 2.0 * h;
+    float s0_end = c;
+    float s1_end = s0_end + H;
+    float s2_end = s1_end + c;
+    float s3_end = s2_end + V;
+    float s4_end = s3_end + c;
+    float s5_end = s4_end + H;
+    float s6_end = s5_end + c;
+    float perimeter = s6_end + V;
+    if (perimeter == 0.0) return 0.0;
+    float dist = 0.0;
+    if (p.x < -w) {
+      if (p.y < -h) {
+        vec2 corner_p = p - vec2(-w, -h);
+        dist = c * ((atan(corner_p.y, corner_p.x) + PI) / (PI / 2.0));
+      } else if (p.y > h) {
+        vec2 corner_p = p - vec2(-w, h);
+        dist = s5_end + c * ((atan(corner_p.y, corner_p.x) - PI / 2.0) / (PI / 2.0));
+      } else {
+        dist = s6_end + (h - p.y);
+      }
+    } else if (p.x > w) {
+      if (p.y < -h) {
+        vec2 corner_p = p - vec2(w, -h);
+        dist = s1_end + c * ((atan(corner_p.y, corner_p.x) + PI / 2.0) / (PI / 2.0));
+      } else if (p.y > h) {
+        vec2 corner_p = p - vec2(w, h);
+        dist = s3_end + c * (atan(corner_p.y, corner_p.x) / (PI / 2.0));
+      } else {
+        dist = s2_end + (h + p.y);
+      }
+    } else {
+      if (p.y < 0.0) {
+        dist = s0_end + (w + p.x);
+      } else {
+        dist = s4_end + (w - p.x);
+      }
+    }
+    return dist / perimeter;
+  }
+
+  float getInterpolatedSize(float progress, vec4 sizes) {
+    float segLen = 1.0 / 3.0;
+    if (progress < segLen) return mix(sizes.x, sizes.y, smoothCubic(progress / segLen));
+    if (progress < 2.0 * segLen) return mix(sizes.y, sizes.z, smoothCubic((progress - segLen) / segLen));
+    return mix(sizes.z, sizes.w, smoothCubic((progress - 2.0 * segLen) / segLen));
+  }
+
+  float gaussian(float x, float sigma) {
+    if (sigma <= 0.0) return 0.0;
+    return exp(-(pow(x, 2.0)) / (2.0 * pow(sigma, 2.0)));
+  }
+
+  // Layer rendering is UNROLLED (Samsung Adreno fix #2 — see top-of-file
+  // comment). 7 inline blocks below, one per layer 0..6. Each accesses
+  // u_colors_N directly without an if/else picker. DO NOT collapse back
+  // into a for(i<10) loop.
   half4 main(vec2 fragCoord) {
-    vec2 center = u_resolution * 0.5;
-    vec2 p = fragCoord - center;
+    vec2 p = fragCoord - u_resolution * 0.5;
     vec2 b = u_rectSize * 0.5;
     float d = sdfRoundedBox(p, b, u_cornerRadius);
     float perimeterProgress = calculatePerimeterProgress(p, b, u_cornerRadius);
 
-    half4 behindGlow = half4(0.0);
-    half4 frontGlow = half4(0.0);
+    half4 behindAcc = half4(0.0);
+    half4 frontAcc = half4(0.0);
 
-    for (int i = 0; i < ${MAX_SKIA_LAYERS}; i++) {
-        if (i >= u_layerCount) break;
-        float animatedProgress = fract(perimeterProgress - u_layerProgress[i] + u_relativeOffset[i]);
-        if (animatedProgress > u_coverage[i] || u_coverage[i] == 0.0) continue;
-        float segmentProgress = animatedProgress / u_coverage[i];
-        float currentGlowSize = getInterpolatedSize(segmentProgress, u_glowSizes[i]);
-        float calculatedOpacity = gaussian(abs(d), 0.0, currentGlowSize);
-        if (d > 0.0 && u_placements[i] == 1.0) calculatedOpacity = 0.0;
-        if (calculatedOpacity > 0.0) {
-            half4 color = half4(0.0);
-            if (i == 0) color = getGradientColor(segmentProgress, u_colors_1);
-            else if (i == 1) color = getGradientColor(segmentProgress, u_colors_2);
-            else if (i == 2) color = getGradientColor(segmentProgress, u_colors_3);
-            else if (i == 3) color = getGradientColor(segmentProgress, u_colors_4);
-            else if (i == 4) color = getGradientColor(segmentProgress, u_colors_5);
-            else if (i == 5) color = getGradientColor(segmentProgress, u_colors_6);
-            else if (i == 6) color = getGradientColor(segmentProgress, u_colors_7);
-            else if (i == 7) color = getGradientColor(segmentProgress, u_colors_8);
-            else if (i == 8) color = getGradientColor(segmentProgress, u_colors_9);
-            else if (i == 9) color = getGradientColor(segmentProgress, u_colors_10);
-
-            half4 glowComponent = color * half(calculatedOpacity) * half(u_opacity[i]);
-            if (u_placements[i] == 0.0) {
-                behindGlow += glowComponent;
-            } else {
-                frontGlow += glowComponent;
-            }
+    // Layer 0 (uses u_colors_1).
+    if (u_opacity[0] > 0.0 && u_coverage[0] > 0.0) {
+      float animatedProgress = fract(perimeterProgress - u_layerProgress[0] + u_relativeOffset[0]);
+      if (animatedProgress <= u_coverage[0]) {
+        float segmentProgress = animatedProgress / u_coverage[0];
+        float glowSize = getInterpolatedSize(segmentProgress, u_glowSizes[0]);
+        float halo = gaussian(abs(d), glowSize);
+        if (d > 0.0 && u_placements[0] == 1.0) halo = 0.0;
+        if (halo > 0.0) {
+          half4 color = getGradientColor(segmentProgress, u_colors_1);
+          half4 glowComponent = color * half(halo) * half(u_opacity[0]);
+          if (u_placements[0] == 0.0) behindAcc += glowComponent;
+          else frontAcc += glowComponent;
         }
+      }
     }
 
-    half4 finalColor = behindGlow;
-    if (d <= 0.0) {
-        finalColor = mix(finalColor, u_backgroundColor, u_backgroundColor.a);
+    // Layer 1 (uses u_colors_2).
+    if (u_opacity[1] > 0.0 && u_coverage[1] > 0.0) {
+      float animatedProgress = fract(perimeterProgress - u_layerProgress[1] + u_relativeOffset[1]);
+      if (animatedProgress <= u_coverage[1]) {
+        float segmentProgress = animatedProgress / u_coverage[1];
+        float glowSize = getInterpolatedSize(segmentProgress, u_glowSizes[1]);
+        float halo = gaussian(abs(d), glowSize);
+        if (d > 0.0 && u_placements[1] == 1.0) halo = 0.0;
+        if (halo > 0.0) {
+          half4 color = getGradientColor(segmentProgress, u_colors_2);
+          half4 glowComponent = color * half(halo) * half(u_opacity[1]);
+          if (u_placements[1] == 0.0) behindAcc += glowComponent;
+          else frontAcc += glowComponent;
+        }
+      }
     }
-    finalColor += frontGlow;
+
+    // Layer 2 (uses u_colors_3).
+    if (u_opacity[2] > 0.0 && u_coverage[2] > 0.0) {
+      float animatedProgress = fract(perimeterProgress - u_layerProgress[2] + u_relativeOffset[2]);
+      if (animatedProgress <= u_coverage[2]) {
+        float segmentProgress = animatedProgress / u_coverage[2];
+        float glowSize = getInterpolatedSize(segmentProgress, u_glowSizes[2]);
+        float halo = gaussian(abs(d), glowSize);
+        if (d > 0.0 && u_placements[2] == 1.0) halo = 0.0;
+        if (halo > 0.0) {
+          half4 color = getGradientColor(segmentProgress, u_colors_3);
+          half4 glowComponent = color * half(halo) * half(u_opacity[2]);
+          if (u_placements[2] == 0.0) behindAcc += glowComponent;
+          else frontAcc += glowComponent;
+        }
+      }
+    }
+
+    // Layer 3 (uses u_colors_4).
+    if (u_opacity[3] > 0.0 && u_coverage[3] > 0.0) {
+      float animatedProgress = fract(perimeterProgress - u_layerProgress[3] + u_relativeOffset[3]);
+      if (animatedProgress <= u_coverage[3]) {
+        float segmentProgress = animatedProgress / u_coverage[3];
+        float glowSize = getInterpolatedSize(segmentProgress, u_glowSizes[3]);
+        float halo = gaussian(abs(d), glowSize);
+        if (d > 0.0 && u_placements[3] == 1.0) halo = 0.0;
+        if (halo > 0.0) {
+          half4 color = getGradientColor(segmentProgress, u_colors_4);
+          half4 glowComponent = color * half(halo) * half(u_opacity[3]);
+          if (u_placements[3] == 0.0) behindAcc += glowComponent;
+          else frontAcc += glowComponent;
+        }
+      }
+    }
+
+    // Layer 4 (uses u_colors_5).
+    if (u_opacity[4] > 0.0 && u_coverage[4] > 0.0) {
+      float animatedProgress = fract(perimeterProgress - u_layerProgress[4] + u_relativeOffset[4]);
+      if (animatedProgress <= u_coverage[4]) {
+        float segmentProgress = animatedProgress / u_coverage[4];
+        float glowSize = getInterpolatedSize(segmentProgress, u_glowSizes[4]);
+        float halo = gaussian(abs(d), glowSize);
+        if (d > 0.0 && u_placements[4] == 1.0) halo = 0.0;
+        if (halo > 0.0) {
+          half4 color = getGradientColor(segmentProgress, u_colors_5);
+          half4 glowComponent = color * half(halo) * half(u_opacity[4]);
+          if (u_placements[4] == 0.0) behindAcc += glowComponent;
+          else frontAcc += glowComponent;
+        }
+      }
+    }
+
+    // Layer 5 (uses u_colors_6).
+    if (u_opacity[5] > 0.0 && u_coverage[5] > 0.0) {
+      float animatedProgress = fract(perimeterProgress - u_layerProgress[5] + u_relativeOffset[5]);
+      if (animatedProgress <= u_coverage[5]) {
+        float segmentProgress = animatedProgress / u_coverage[5];
+        float glowSize = getInterpolatedSize(segmentProgress, u_glowSizes[5]);
+        float halo = gaussian(abs(d), glowSize);
+        if (d > 0.0 && u_placements[5] == 1.0) halo = 0.0;
+        if (halo > 0.0) {
+          half4 color = getGradientColor(segmentProgress, u_colors_6);
+          half4 glowComponent = color * half(halo) * half(u_opacity[5]);
+          if (u_placements[5] == 0.0) behindAcc += glowComponent;
+          else frontAcc += glowComponent;
+        }
+      }
+    }
+
+    // Layer 6 (uses u_colors_7).
+    if (u_opacity[6] > 0.0 && u_coverage[6] > 0.0) {
+      float animatedProgress = fract(perimeterProgress - u_layerProgress[6] + u_relativeOffset[6]);
+      if (animatedProgress <= u_coverage[6]) {
+        float segmentProgress = animatedProgress / u_coverage[6];
+        float glowSize = getInterpolatedSize(segmentProgress, u_glowSizes[6]);
+        float halo = gaussian(abs(d), glowSize);
+        if (d > 0.0 && u_placements[6] == 1.0) halo = 0.0;
+        if (halo > 0.0) {
+          half4 color = getGradientColor(segmentProgress, u_colors_7);
+          half4 glowComponent = color * half(halo) * half(u_opacity[6]);
+          if (u_placements[6] == 0.0) behindAcc += glowComponent;
+          else frontAcc += glowComponent;
+        }
+      }
+    }
+
+    half4 finalColor = behindAcc;
+    if (d <= 0.0) {
+      finalColor = mix(finalColor, u_backgroundColor, u_backgroundColor.a);
+    }
+    finalColor += frontAcc;
 
     if (u_isBorderAnimated > 0.5 && u_borderWidth > 0.0) {
-      float borderDist = abs(d);
       float halfWidth = u_borderWidth / 2.0;
-      float borderStrength = 1.0 - smoothstep(halfWidth - 1.0, halfWidth + 1.0, borderDist);
+      float borderStrength = 1.0 - smoothstep(halfWidth - 1.0, halfWidth + 1.0, abs(d));
       if (borderStrength > 0.0) {
-        float borderAnimatedProgress = fract(perimeterProgress - u_borderProgress);
-        half4 borderColor = getGradientColor(borderAnimatedProgress, u_colors_0);
+        float borderT = fract(perimeterProgress - u_borderProgress);
+        half4 borderColor = getGradientColor(borderT, u_colors_0);
         finalColor = mix(finalColor, borderColor, half(borderStrength));
       }
     }

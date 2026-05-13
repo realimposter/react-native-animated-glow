@@ -1,6 +1,6 @@
 {
   "name": "react-native-animated-glow",
-  "version": "3.1.0",
+  "version": "3.2.0",
   "description": "A performant, highly-customizable animated glow effect for React Native, powered by Skia and Reanimated.",
   "main": "lib/commonjs/index.js",
   "module": "lib/module/index.js",
